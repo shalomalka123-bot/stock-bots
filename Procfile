@@ -1,1 +1,1 @@
-worker: python catalyst_news_bot.py
+worker: python start_bots.py

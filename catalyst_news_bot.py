@@ -745,15 +745,6 @@ NEGATIVE_CATALYSTS = {
             "doj probe", "federal prosecutors"
         ]
     },
-    "📜 תביעה ייצוגית": {
-        "strength": 3, "category": "SEC_INVESTIGATION",
-        "keywords": [
-            "class action lawsuit", "securities fraud lawsuit",
-            "shareholder lawsuit", "class action filed",
-            "securities class action", "investor lawsuit",
-            "alleges securities fraud", "investors sue"
-        ]
-    },
     "❌ דחיית FDA": {
         "strength": 5, "category": "PHASE_3_FAILURE",
         "keywords": [

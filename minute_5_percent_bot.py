@@ -2,9 +2,6 @@ import os
 import time
 import random
 import subprocess
-import json
-from urllib.request import urlopen
-from urllib.parse import urlencode, quote_plus
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -17,51 +14,36 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
 
 
+# ===== API KEYS =====
 API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
 if not API_KEY or not SECRET_KEY:
     print("Missing ALPACA API keys")
     raise SystemExit
 
+
+# ===== CLIENTS =====
 client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 trading_client = TradingClient(API_KEY, SECRET_KEY)
 
+
+# ===== SETTINGS =====
 DATA_FEED = DataFeed.SIP
 
 MIN_PRICE = 0.20
 MAX_PRICE = 20.0
+
 MAX_SYMBOLS = 10000
-
-SCAN_EVERY_SECONDS = 5
 CHUNK_SIZE = 500
+SCAN_EVERY_SECONDS = 5
 
-MIN_ALERT_PERCENT =5
-MIN_VOLUME = 200000
-VOLUME_RATIO = 2.5
-COOLDOWN_SECONDS = 60
+MIN_VOLUME = 50000
+MIN_VOLUME_RATIO = 2.0
 
-NEWS_LOOKBACK_SECONDS = 3600
-NEWS_MIN_SCORE = 2
+COOLDOWN_SECONDS = 90
 
-POSITIVE_NEWS_KEYWORDS = [
-    "fda", "approval", "approved", "clearance",
-    "phase", "trial", "clinical", "positive results",
-    "contract", "agreement", "partnership",
-    "collaboration", "purchase order",
-    "earnings beat", "record revenue", "raises guidance",
-    "merger", "acquisition", "buyout",
-    "investment", "patent", "launch", "license",
-    "ai", "artificial intelligence", "crypto",
-    "bitcoin", "defense", "military", "ev"
-]
-
-NEGATIVE_NEWS_KEYWORDS = [
-    "offering", "public offering", "dilution",
-    "reverse split", "delisting", "bankruptcy",
-    "lawsuit", "investigation", "resigns"
-]
+LOOKBACK_MINUTES = 12
 
 last_alert = {}
 
@@ -73,27 +55,10 @@ def israel_time():
 
 
 def send_telegram(message):
-    bot_token = os.getenv("CATALYST_BOT_TOKEN")
-    chat_id = os.getenv("CATALYST_CHAT_ID")
-
-    if not bot_token or not chat_id:
-        print("Missing Telegram bot token or chat id")
-        return
-
-    try:
-        params = urlencode({
-            "chat_id": chat_id,
-            "text": message
-        })
-
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage?{params}"
-        response = urlopen(url, timeout=10)
-        result = response.read().decode("utf-8")
-
-        print(f"Telegram sent successfully: {result}")
-
-    except Exception as e:
-        print(f"Telegram send error: {e}")
+    subprocess.run(
+        ["python3", "scripts/send_telegram.py", message],
+        check=False
+    )
 
 
 def change_percent(start_price, current_price):
@@ -117,85 +82,6 @@ def can_send(symbol):
 def split_chunks(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
-
-
-def investing_search_link(symbol):
-    query = quote_plus(symbol)
-    return f"https://www.investing.com/search/?q={query}"
-
-
-def get_alert_title(percent, has_strong_news):
-    if percent >= 12:
-        base_title = "💣 12%+ בדקה"
-    elif percent >= 8:
-        base_title = "🚀 8%+ בדקה"
-    else:
-        base_title = "🔥 5%+ בדקה"
-
-    if has_strong_news:
-        return f"{base_title} + חדשות 📰"
-
-    return base_title
-
-
-def score_news_text(text):
-    text = text.lower()
-    score = 0
-
-    for word in POSITIVE_NEWS_KEYWORDS:
-        if word in text:
-            score += 1
-
-    for word in NEGATIVE_NEWS_KEYWORDS:
-        if word in text:
-            score -= 3
-
-    return score
-
-
-def get_recent_news(symbol):
-    try:
-        if not FINNHUB_API_KEY:
-            return None, 0
-
-        today = datetime.now(timezone.utc).date()
-        yesterday = today - timedelta(days=1)
-
-        params = urlencode({
-            "symbol": symbol,
-            "from": yesterday.isoformat(),
-            "to": today.isoformat(),
-            "token": FINNHUB_API_KEY
-        })
-
-        url = f"https://finnhub.io/api/v1/company-news?{params}"
-        response = urlopen(url, timeout=5)
-        data = json.loads(response.read().decode("utf-8"))
-
-        cutoff_time = int(time.time()) - NEWS_LOOKBACK_SECONDS
-
-        best_news = None
-        best_score = 0
-
-        for news in data:
-            news_time = news.get("datetime", 0)
-
-            if news_time < cutoff_time:
-                continue
-
-            headline = news.get("headline", "")
-            summary = news.get("summary", "")
-            score = score_news_text(f"{headline} {summary}")
-
-            if score > best_score:
-                best_score = score
-                best_news = news
-
-        return best_news, best_score
-
-    except Exception as e:
-        print(f"News error for {symbol}: {e}")
-        return None, 0
 
 
 def get_symbols():
@@ -233,7 +119,7 @@ def get_symbols():
 
 def get_bars(symbols):
     end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(minutes=4)
+    start_time = end_time - timedelta(minutes=LOOKBACK_MINUTES)
 
     request = StockBarsRequest(
         symbol_or_symbols=symbols,
@@ -246,72 +132,139 @@ def get_bars(symbols):
     return client.get_stock_bars(request)
 
 
-def get_buy_sell_pressure(last_bar):
-    open_price = float(last_bar.open)
-    close_price = float(last_bar.close)
-    volume = int(last_bar.volume)
+def get_window_change(bars, minutes):
+    if len(bars) < minutes:
+        return 0
 
-    if close_price > open_price:
-        return volume, 0, "קונים שולטים"
+    start_price = float(bars[-minutes].open)
+    current_price = float(bars[-1].close)
 
-    if close_price < open_price:
-        return 0, volume, "מוכרים שולטים"
+    return change_percent(start_price, current_price)
 
-    return 0, 0, "מאוזן"
+
+def is_near_recent_high(bars):
+    if len(bars) < 3:
+        return False
+
+    current_price = float(bars[-1].close)
+    previous_bars = bars[:-1]
+
+    recent_high = max(float(bar.high) for bar in previous_bars)
+
+    return current_price >= recent_high * 0.997
+
+
+def get_volume_ratio(bars):
+    if len(bars) < 3:
+        return 0
+
+    last_volume = int(bars[-1].volume)
+    previous_bars = bars[:-1]
+
+    avg_volume = sum(int(bar.volume) for bar in previous_bars) / len(previous_bars)
+
+    if avg_volume <= 0:
+        return 0
+
+    return last_volume / avg_volume
+
+
+def get_alert_level(change_1m, change_3m, change_5m, change_10m):
+    strong_alert = (
+        change_1m >= 5
+        or change_5m >= 8
+        or change_10m >= 15
+    )
+
+    medium_alert = (
+        change_1m >= 3
+        or change_3m >= 5
+        or change_5m >= 5
+        or change_10m >= 10
+    )
+
+    early_alert = (
+        change_1m >= 1.5
+        or change_3m >= 3
+        or change_5m >= 4
+    )
+
+    if strong_alert:
+        return "strong"
+
+    if medium_alert:
+        return "medium"
+
+    if early_alert:
+        return "early"
+
+    return None
 
 
 def check_momentum(symbols):
     for chunk in split_chunks(symbols, CHUNK_SIZE):
-        barset = get_bars(chunk)
+        try:
+            barset = get_bars(chunk)
+        except Exception as e:
+            print(f"Bars error for chunk: {e}")
+            continue
 
         for symbol in chunk:
             bars = barset.data.get(symbol, [])
 
-            if len(bars) < 2:
+            if len(bars) < 3:
                 continue
 
             bars = sorted(bars, key=lambda b: b.timestamp)
 
             last_bar = bars[-1]
-            previous_bars = bars[:-1]
 
-            start_price = float(last_bar.open)
+            last_open = float(last_bar.open)
             current_price = float(last_bar.close)
-            volume = int(last_bar.volume)
+            last_volume = int(last_bar.volume)
 
-            if start_price <= 0 or current_price <= 0:
+            if last_open <= 0 or current_price <= 0:
                 continue
 
             if current_price < MIN_PRICE or current_price > MAX_PRICE:
                 continue
 
-            avg_volume = (
-                sum(int(bar.volume) for bar in previous_bars)
-                / len(previous_bars)
+            change_1m = change_percent(last_open, current_price)
+            change_3m = get_window_change(bars, 3)
+            change_5m = get_window_change(bars, 5)
+            change_10m = get_window_change(bars, 10)
+
+            volume_ratio = get_volume_ratio(bars)
+
+            is_green_bar = current_price > last_open
+            near_high = is_near_recent_high(bars)
+
+            alert_level = get_alert_level(
+                change_1m,
+                change_3m,
+                change_5m,
+                change_10m
             )
 
-            if avg_volume <= 0:
-                continue
-
-            percent = change_percent(start_price, current_price)
-            volume_ratio = volume / avg_volume
-
-            buy_pressure, sell_pressure, pressure_text = get_buy_sell_pressure(last_bar)
-
             print(
-                f"[1 MIN] {symbol} | "
-                f"change: {percent:.2f}% | "
+                f"{symbol} | "
+                f"1m: {change_1m:.2f}% | "
+                f"3m: {change_3m:.2f}% | "
+                f"5m: {change_5m:.2f}% | "
+                f"10m: {change_10m:.2f}% | "
                 f"price: {current_price} | "
-                f"volume: {volume:,} | "
+                f"volume: {last_volume:,} | "
                 f"ratio: {volume_ratio:.2f}x | "
-                f"{pressure_text}"
+                f"green: {is_green_bar} | "
+                f"near high: {near_high}"
             )
 
             is_candidate = (
-                percent >= MIN_ALERT_PERCENT
-                and volume >= MIN_VOLUME
-                and volume_ratio >= VOLUME_RATIO
-                and buy_pressure > sell_pressure
+                alert_level is not None
+                and last_volume >= MIN_VOLUME
+                and volume_ratio >= MIN_VOLUME_RATIO
+                and is_green_bar
+                and near_high
             )
 
             if not is_candidate:
@@ -320,44 +273,12 @@ def check_momentum(symbols):
             if not can_send(symbol):
                 continue
 
-            news, news_score = get_recent_news(symbol)
-
-            has_strong_news = (
-                news is not None
-                and news_score >= NEWS_MIN_SCORE
-            )
-
-            title = get_alert_title(percent, has_strong_news)
-
-            if has_strong_news:
-                headline = news.get("headline", "")
-                source = news.get("source", "")
-                news_url = news.get("url", "")
-
-                news_part = (
-                    f"📰 כותרת: {headline}\n"
-                    f"ציון חדשות: {news_score}\n"
-                    f"מקור: {source}\n"
-                    f"קישור חדשות: {news_url}\n"
-                )
-            else:
-                news_part = "חדשות חזקות בשעה האחרונה: לא נמצאו\n"
-
-            investing_link = investing_search_link(symbol)
-
             message = (
-                f"{title}\n"
-                f"מניה: {symbol}\n"
-                f"מחיר נוכחי: {current_price}\n"
-                f"שינוי בדקה האחרונה: {percent:.2f}%\n"
-                f"ווליום דקה אחרונה: {volume:,}\n"
-                f"יחס ווליום: {volume_ratio:.2f}x\n"
-                f"לחץ קונים משוער: {buy_pressure:,}\n"
-                f"לחץ מוכרים משוער: {sell_pressure:,}\n"
-                f"כיוון נר: {pressure_text}\n"
-                f"{news_part}"
-                f"🔎 Investing חיפוש: {investing_link}\n"
-                f"שעה בישראל: {israel_time()}"
+    f"מניה: {symbol}\n"
+    f"מחיר נוכחי: {current_price}\n"
+    f"שינוי בדקה האחרונה: {change_1m:.2f}%\n"
+    f"ווליום בדקה האחרונה: {last_volume:,}\n"
+    f"מומנטום: 3דק: {change_3m:.2f}% | 5דק: {change_5m:.2f}% | 10דק: {change_10m:.2f}%"
             )
 
             send_telegram(message)
@@ -365,13 +286,12 @@ def check_momentum(symbols):
 
 SYMBOLS = get_symbols()
 
-print("5% PER MINUTE BOT STARTED")
+print("MOMENTUM BOT STARTED")
 print(f"TOTAL SYMBOLS: {len(SYMBOLS)}")
 print(f"PRICE RANGE: {MIN_PRICE}$ - {MAX_PRICE}$")
 print(f"SCAN EVERY: {SCAN_EVERY_SECONDS} seconds")
-print("ALERT LEVELS: 5%, 8%, 12% in 1 minute")
 print(f"MIN VOLUME: {MIN_VOLUME:,}")
-print(f"MIN VOLUME RATIO: {VOLUME_RATIO}x")
+print(f"MIN VOLUME RATIO: {MIN_VOLUME_RATIO}x")
 print(f"COOLDOWN: {COOLDOWN_SECONDS} seconds per symbol")
 print("---------------------------------------------")
 
@@ -381,7 +301,7 @@ while True:
         time.sleep(SCAN_EVERY_SECONDS)
 
     except KeyboardInterrupt:
-        print("5% PER MINUTE BOT STOPPED BY USER")
+        print("MOMENTUM BOT STOPPED BY USER")
         break
 
     except Exception as e:

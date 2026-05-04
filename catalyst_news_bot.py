@@ -3,6 +3,7 @@ import time
 import json
 import re
 from urllib.request import urlopen, Request
+import html
 from urllib.parse import urlencode, quote
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -745,6 +746,15 @@ NEGATIVE_CATALYSTS = {
             "doj probe", "federal prosecutors"
         ]
     },
+    "📜 תביעה ייצוגית": {
+        "strength": 3, "category": "SEC_INVESTIGATION",
+        "keywords": [
+            "class action lawsuit", "securities fraud lawsuit",
+            "shareholder lawsuit", "class action filed",
+            "securities class action", "investor lawsuit",
+            "alleges securities fraud", "investors sue"
+        ]
+    },
     "❌ דחיית FDA": {
         "strength": 5, "category": "PHASE_3_FAILURE",
         "keywords": [
@@ -895,6 +905,367 @@ NOISE_PATTERNS = [
     "dividend stocks", "dividend report", "dividend portfolio"
 ]
 
+
+
+LAW_FIRM_SPAM_PATTERNS = [
+    "lead plaintiff",
+    "lead plaintiff deadline",
+    "class action deadline",
+    "securities fraud lawsuit",
+    "class action lawsuit",
+    "shareholder alert",
+    "investor alert",
+    "law offices of",
+    "rosen law firm",
+    "pomerantz law firm",
+    "levi & korsinsky",
+    "bronstein, gewirtz",
+    "glancy prongay",
+    "faruqi & faruqi",
+    "kessler topaz",
+    "the schall law firm",
+    "berger montague",
+    "block & leviton",
+    "bragar eagel",
+    "gross law firm",
+    "kirby mcinerney",
+    "labaton",
+    "class period",
+    "reminds investors",
+    "encourages investors",
+    "contact the firm",
+    "no cost to you",
+    "recover losses"
+]
+
+BLOCK_PATTERNS = [
+    "announces participation",
+    "to present at",
+    "fireside chat",
+    "webcast",
+    "investor conference",
+    "annual meeting",
+    "shareholder meeting",
+    "conference call details",
+    "presentation at"
+]
+
+WEAK_PR_PATTERNS = [
+    "launches new website",
+    "launches initiative",
+    "expands platform",
+    "announces new brand",
+    "corporate update",
+    "business update",
+    "letter to shareholders",
+    "appoints",
+    "appointment of",
+    "joins board",
+    "advisory board",
+    "sponsor",
+    "marketing campaign"
+]
+
+DILUTION_RISK_PATTERNS = [
+    "registered direct offering",
+    "public offering",
+    "at-the-market offering",
+    "atm offering",
+    "shelf offering",
+    "warrants",
+    "convertible note",
+    "convertible notes",
+    "priced offering",
+    "private placement"
+]
+
+EXTREME_NEGATIVE_PATTERNS = [
+    "chapter 11",
+    "bankruptcy",
+    "going concern",
+    "nasdaq delisting",
+    "delisting determination",
+    "minimum bid notification",
+    "reverse stock split"
+]
+
+
+def clean_text(text):
+    if not text:
+        return ""
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def has_any(text, patterns):
+    t = (text or "").lower()
+    return any(p in t for p in patterns)
+
+
+def is_law_firm_spam(headline, summary, source):
+    text = f"{headline} {summary} {source}".lower()
+
+    if has_any(text, LAW_FIRM_SPAM_PATTERNS):
+        return True
+
+    legal_count = sum(1 for w in [
+        "law firm", "lead plaintiff", "class action",
+        "securities fraud", "shareholder lawsuit"
+    ] if w in text)
+
+    return legal_count >= 2
+
+
+def get_source_score(source):
+    s = (source or "").lower()
+
+    if "sec" in s or "edgar" in s:
+        return 12, "אמינות גבוהה מאוד - SEC"
+    if "fda" in s:
+        return 12, "אמינות גבוהה מאוד - FDA"
+    if "usaspending" in s:
+        return 12, "אמינות גבוהה מאוד - מקור ממשלתי"
+    if "businesswire" in s:
+        return 8, "אמינות גבוהה - BusinessWire"
+    if "globenewswire" in s:
+        return 7, "אמינות טובה - GlobeNewswire"
+    if "prnewswire" in s:
+        return -3, "אמינות זהירה - PRNewswire"
+    if "finnhub" in s:
+        return 2, "אמינות בינונית - אגרגטור חדשות"
+
+    return 0, "מקור רגיל"
+
+
+def get_quality_label(score):
+    if score >= 93:
+        return "💎 נדיר מאוד"
+    if score >= 85:
+        return "🚀 חזק מאוד"
+    if score >= 75:
+        return "🔥 חזק"
+    if score >= 70:
+        return "🟡 בינוני־חזק"
+    return "⚪ חלש"
+
+
+def extract_money_amount(text):
+    """
+    מחלץ סכום כסף מהידיעה.
+    מחזיר דולר משוער.
+    """
+    t = text.lower().replace(",", "")
+
+    patterns = [
+        r"\$([\d\.]+)\s*billion",
+        r"\$([\d\.]+)\s*bn",
+        r"\$([\d\.]+)\s*million",
+        r"\$([\d\.]+)\s*mln",
+        r"\$([\d\.]+)m\b",
+        r"\$([\d\.]+)b\b"
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, t)
+        if not m:
+            continue
+
+        value = float(m.group(1))
+
+        if "billion" in pat or "bn" in pat or "b\\b" in pat:
+            return value * 1_000_000_000
+        return value * 1_000_000
+
+    return 0
+
+
+def calculate_news_quality(
+    ticker,
+    headline,
+    summary,
+    source,
+    positive_found,
+    negative_found,
+    meta
+):
+    """
+    מנוע דירוג איכות 0-100.
+    המטרה: לשלוח רק חדשות חיוביות חזקות יחסית.
+    """
+    headline = clean_text(headline)
+    summary = clean_text(summary)
+    text = f"{headline} {summary}"
+    text_lower = text.lower()
+
+    reasons = []
+    score = 0
+
+    # חסימת ספאם עורכי דין
+    if is_law_firm_spam(headline, summary, source):
+        return {
+            "send": False,
+            "score": 0,
+            "label": "❌ חסום",
+            "reason": "פרסום עורכי דין / תביעה ייצוגית - רעש",
+            "reasons": ["פרסום עורכי דין / תביעה ייצוגית"],
+            "news_type": "רעש משפטי"
+        }
+
+    # כרגע מתמקדים רק בידיעות חיוביות
+    if not positive_found:
+        return {
+            "send": False,
+            "score": 0,
+            "label": "❌ לא חיובי",
+            "reason": "אין קטליזטור חיובי",
+            "reasons": ["אין קטליזטור חיובי"],
+            "news_type": "לא רלוונטי"
+        }
+
+    # חסימת כנסים רגילים
+    if has_any(text_lower, BLOCK_PATTERNS):
+        return {
+            "send": False,
+            "score": 0,
+            "label": "❌ חסום",
+            "reason": "כנס / מצגת / webcast - לרוב לא מזיז מניה",
+            "reasons": ["כנס או מצגת משקיעים"],
+            "news_type": "יח״צ חלש"
+        }
+
+    # בסיס לפי קטגוריה
+    category_scores = {
+        "FDA_APPROVAL": 88,
+        "PHASE_3_SUCCESS": 90,
+        "ACQUISITION": 92,
+        "STRATEGIC_INVESTMENT": 76,
+        "AI_PARTNERSHIP": 74,
+        "CRYPTO_TREASURY": 82,
+        "DOD_CONTRACT": 68,
+        "AI_PIVOT": 62
+    }
+
+    best = max(positive_found, key=lambda x: x["strength"])
+    primary_category = best["category"]
+    score = category_scores.get(primary_category, 55)
+
+    reasons.append(f"קטגוריה ראשית: {primary_category}")
+
+    # מקור
+    source_bonus, source_reason = get_source_score(source)
+    score += source_bonus
+    reasons.append(source_reason)
+
+    # תבניות חזקות במיוחד
+    strong_phrases = [
+        "fda approves",
+        "receives fda approval",
+        "granted fda approval",
+        "met primary endpoint",
+        "achieved primary endpoint",
+        "positive topline results",
+        "definitive agreement to acquire",
+        "to be acquired by",
+        "all-cash transaction",
+        "strategic investment",
+        "awarded contract",
+        "wins contract",
+        "government contract awarded"
+    ]
+
+    if has_any(text_lower, strong_phrases):
+        score += 8
+        reasons.append("נמצאה תבנית משפט חזקה")
+
+    # תבניות חלשות
+    if has_any(text_lower, WEAK_PR_PATTERNS):
+        score -= 18
+        reasons.append("יח״צ חלש / הודעה שיווקית")
+
+    # דילול - לא תמיד חוסם, אבל מוריד חזק
+    if has_any(text_lower, DILUTION_RISK_PATTERNS):
+        score -= 25
+        reasons.append("סיכון דילול / גיוס הון")
+
+    # שלילי קיצוני - חוסם
+    if has_any(text_lower, EXTREME_NEGATIVE_PATTERNS):
+        return {
+            "send": False,
+            "score": 0,
+            "label": "❌ חסום",
+            "reason": "סיכון שלילי קיצוני",
+            "reasons": ["סיכון שלילי קיצוני"],
+            "news_type": "סיכון גבוה"
+        }
+
+    # חוזה ביחס לשווי שוק
+    amount = extract_money_amount(text)
+    market_cap = meta.get("market_cap", 0) if meta else 0
+
+    if amount and market_cap:
+        ratio = amount / market_cap
+
+        if ratio >= 0.10:
+            score += 18
+            reasons.append(f"חוזה/סכום מעל 10% משווי החברה ({ratio*100:.1f}%)")
+        elif ratio >= 0.03:
+            score += 10
+            reasons.append(f"חוזה/סכום 3%-10% משווי החברה ({ratio*100:.1f}%)")
+        elif ratio >= 0.01:
+            score += 4
+            reasons.append(f"חוזה/סכום 1%-3% משווי החברה ({ratio*100:.1f}%)")
+        else:
+            score -= 8
+            reasons.append(f"סכום קטן ביחס לשווי החברה ({ratio*100:.2f}%)")
+
+    # AI / Crypto / Quantum - נותנים ניסיון, אבל לא משתגעים
+    hot_words = ["artificial intelligence", " ai ", "nvidia", "openai", "quantum", "bitcoin", "ethereum", "crypto"]
+    if has_any(f" {text_lower} ", hot_words):
+        score += 5
+        reasons.append("תחום חם: AI / Crypto / Quantum")
+
+    # מניעת ציון מעל 100 או מתחת 0
+    score = max(0, min(100, int(score)))
+
+    label = get_quality_label(score)
+
+    if score >= 75:
+        news_type = "ידיעה חיובית חזקה"
+    elif score >= 70:
+        news_type = "ידיעה בינונית־חזקה לבדיקה"
+    else:
+        news_type = "ידיעה חלשה"
+
+    return {
+        "send": score >= 70,
+        "score": score,
+        "label": label,
+        "reason": " + ".join(reasons[:3]),
+        "reasons": reasons,
+        "news_type": news_type,
+        "primary_category": primary_category
+    }
+
+
+def make_smart_alert_hash(symbol, headline):
+    """
+    כפילות חכמה:
+    מנקה מילים נפוצות ומשאיר ליבה.
+    """
+    h = clean_text(headline).lower()
+    h = re.sub(r"[^a-z0-9\s]", " ", h)
+    h = re.sub(r"\s+", " ", h)
+
+    remove_words = [
+        "announces", "reports", "today", "inc", "corp", "corporation",
+        "company", "shares", "stock", "new", "the", "and", "with"
+    ]
+
+    words = [w for w in h.split() if w not in remove_words and len(w) > 2]
+    core = " ".join(words[:10])
+    return f"{symbol}|{core}"
 
 def is_noise(headline):
     """בודק אם הכותרת היא רעש"""
@@ -1438,127 +1809,137 @@ def parse_rss_items(rss_content):
 # מעבד כללי לכתבת חדשות
 # ============================================================
 def process_news_item(news, source_override=None):
-    headline = news.get("headline", "")
-    summary = news.get("summary", "")
+    headline = clean_text(news.get("headline", ""))
+    summary = clean_text(news.get("summary", ""))
     url_link = news.get("url", "")
     related = news.get("related", "")
     published = news.get("datetime", time.time())
+    source = source_override or news.get("source", "Unknown")
 
-    # סינון: שעה אחרונה בלבד
+    # שעה אחרונה בלבד
     if time.time() - published > NEWS_MAX_AGE_SECONDS:
         return
-    
-    # סינון רעש
+
+    # רעש כללי
     if is_noise(headline):
         return
-    
+
     full_text = f"{headline} {summary}"
+
     positive_found = detect_catalysts(full_text, POSITIVE_CATALYSTS)
     negative_found = detect_catalysts(full_text, NEGATIVE_CATALYSTS)
-
-    if not positive_found and not negative_found:
-        return
 
     ticker = extract_ticker_from_news(related, headline, summary)
     if not ticker:
         return
-    
-    # סינון: הכתבה חייבת להיות על חברה אחת מרכזית
+
+    # הכתבה חייבת להיות ממוקדת חברה
     if not is_company_focused(ticker, headline, summary):
         return
-    
-    # סינון מחיר - עד $70
+
+    # מחיר
     price = get_current_price(ticker)
     if not price or price > MAX_PRICE:
         return
 
-    alert_hash = make_alert_hash(ticker, headline)
+    meta = get_finnhub_company_profile(ticker)
+
+    # מנוע דירוג איכות
+    quality = calculate_news_quality(
+        ticker=ticker,
+        headline=headline,
+        summary=summary,
+        source=source,
+        positive_found=positive_found,
+        negative_found=negative_found,
+        meta=meta
+    )
+
+    if not quality["send"]:
+        print(f"[SKIP] {ticker} | {quality['reason']} | {headline[:80]}")
+        return
+
+    # כפילויות חכמות
+    alert_hash = make_smart_alert_hash(ticker, headline)
     if alert_hash in sent_alerts:
         return
 
-    source = source_override or news.get("source", "Unknown")
-    send_news_alert(ticker, headline, source, url_link,
-                    positive_found, negative_found, published, price)
-    sent_alerts.add(alert_hash)
+    send_news_alert(
+        ticker=ticker,
+        headline=headline,
+        summary=summary,
+        source=source,
+        url_link=url_link,
+        positive=positive_found,
+        negative=negative_found,
+        published=published,
+        price=price,
+        meta=meta,
+        quality=quality
+    )
 
 
-def send_news_alert(ticker, headline, source, url_link, positive, negative, published, price):
-    if positive and not negative:
-        emoji_header = "🚀🔥💥"
-        type_text = "ידיעה חיובית - פוטנציאל זינוק"
-        catalysts = positive
-    elif negative and not positive:
-        emoji_header = "🚨⚠️📉"
-        type_text = "ידיעה שלילית - פוטנציאל ירידה"
-        catalysts = negative
-    else:
-        emoji_header = "🚨🔄"
-        type_text = "ידיעה מעורבת"
-        catalysts = positive + negative
+def send_news_alert(
+    ticker,
+    headline,
+    summary,
+    source,
+    url_link,
+    positive,
+    negative,
+    published,
+    price,
+    meta,
+    quality
+):
+    company_name = meta.get("name") or ticker_to_company.get(ticker, "לא ידוע")
+    sector_he = meta.get("sector_he", "לא ידוע")
+    market_cap_label = get_market_cap_label(meta.get("market_cap", 0))
 
-    max_strength = max([c["strength"] for c in catalysts]) if catalysts else 1
-    strength_emoji = get_strength_emoji(max_strength)
-    primary_category = catalysts[0]["category"] if catalysts else "FDA_APPROVAL"
-
-    meta = get_finnhub_company_profile(ticker)
-    sector_he = meta["sector_he"]
-    sector_en = meta["sector_en"]
-    market_cap_label = get_market_cap_label(meta["market_cap"])
-
-    # תרגום הכותרת המקורית של הכתבה לעברית
     headline_he = translate_to_hebrew(headline)
 
-    time_label = time_ago_label(published)
+    summary_clean = clean_text(summary)
+    if not summary_clean:
+        summary_clean = headline
+
+    summary_he = translate_to_hebrew(summary_clean[:700])
+
     publish_time = format_us_eastern_time(published)
 
-    catalyst_lines = []
-    seen = set()
-    for c in catalysts:
-        if c["catalyst"] in seen:
-            continue
-        seen.add(c["catalyst"])
-        catalyst_lines.append(c["catalyst"])
+    reasons_text = "\n".join([f"• {r}" for r in quality.get("reasons", [])[:4]])
 
-    similar = find_similar_case(primary_category, sector_en, meta["market_cap"])
-    if similar:
-        similar_text = (
-            f"📊 מקרה דומה: {similar['ticker']} - {similar['change']} ({similar['date']})\n"
-            f"   סיבה: {similar['reason']}\n"
-            f"   🔗 {similar['url']}"
-        )
-    else:
-        stat = CATEGORY_STATS.get(primary_category, "אין סטטיסטיקה זמינה")
-        similar_text = (
-            f"📊 מקרה דומה: אין מקרה דומה במאגר\n"
-            f"   📈 סטטיסטיקה: {stat}"
-        )
+    score = quality["score"]
+    label = quality["label"]
+    news_type = quality["news_type"]
 
     message = (
-        f"{emoji_header} {type_text}\n"
+        f"{label} | ציון איכות: {score}/100\n"
+        f"{news_type}\n"
         f"\n"
         f"📊 סימבול: {ticker}\n"
+        f"🏢 שם החברה: {company_name}\n"
         f"💼 שווי שוק: {market_cap_label}\n"
-        f"🏢 מגזר: {sector_he}\n"
+        f"💵 מחיר מניה: ${price:.2f}\n"
+        f"🏭 מגזר: {sector_he}\n"
         f"\n"
-        f"📰 כותרת בעברית:\n{headline_he}\n"
+        f"📰 כותרת:\n"
+        f"{headline_he}\n"
         f"\n"
-        f"🎯 קטליזטורים שזוהו:\n"
-        f"{chr(10).join(catalyst_lines)}\n"
+        f"📋 תוכן הידיעה:\n"
+        f"{summary_he[:900]}\n"
         f"\n"
+        f"🧠 סיבת הדירוג:\n"
+        f"{reasons_text}\n"
+        f"\n"
+        f"📅 פורסם בתאריך: {publish_time}\n"
         f"📡 מקור: {source}\n"
-        f"🔗 קישור לכתבה:\n{url_link}\n"
         f"\n"
-        f"💵 מחיר נוכחי: ${price:.2f}\n"
-        f"📅 פורסם: {publish_time}\n"
-        f"⏰ {time_label}\n"
-        f"\n"
-        f"🔥 עוצמה: {strength_emoji} ({max_strength}/5)\n"
-        f"\n"
-        f"{similar_text}"
+        f"🔗 קישור לכתבה:\n"
+        f"{url_link}"
     )
 
     if send_telegram(message):
-        print(f"[ALERT] {ticker} | ${price:.2f} | strength {max_strength}/5")
+        print(f"[ALERT] {ticker} | score {score}/100 | ${price:.2f}")
 
 
 # ============================================================
@@ -1602,6 +1983,17 @@ send_telegram(
     f"  • מקרה דומה לכל התראה"
 )
 
+print("TEST MODE START")
+
+test_message = (
+    "🧪 בדיקת בוט\n"
+    "\n"
+    "אם אתה רואה את ההודעה הזאת — הבוט עובד תקין 🚀"
+)
+
+send_telegram(test_message)
+
+print("TEST MESSAGE SENT")
 
 while True:
     try:

@@ -37,8 +37,8 @@ MAX_SYMBOLS = 10000
 SCAN_EVERY_SECONDS = 5
 CHUNK_SIZE = 500
 
-MIN_ALERT_PERCENT =0.01
-MIN_VOLUME = 1000
+MIN_ALERT_PERCENT =5
+MIN_VOLUME = 200000
 VOLUME_RATIO = 2.5
 COOLDOWN_SECONDS = 60
 
@@ -73,10 +73,27 @@ def israel_time():
 
 
 def send_telegram(message):
-    subprocess.run(
-        ["python3", "scripts/send_telegram.py", message],
-        check=False
-    )
+    bot_token = os.getenv("CATALYST_BOT_TOKEN")
+    chat_id = os.getenv("CATALYST_CHAT_ID")
+
+    if not bot_token or not chat_id:
+        print("Missing Telegram bot token or chat id")
+        return
+
+    try:
+        params = urlencode({
+            "chat_id": chat_id,
+            "text": message
+        })
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage?{params}"
+        response = urlopen(url, timeout=10)
+        result = response.read().decode("utf-8")
+
+        print(f"Telegram sent successfully: {result}")
+
+    except Exception as e:
+        print(f"Telegram send error: {e}")
 
 
 def change_percent(start_price, current_price):

@@ -172,36 +172,40 @@ session_stats = load_session_stats()
 # =========================================================
 # TELEGRAM
 # =========================================================
+from urllib.request import urlopen, Request
+from urllib.parse import urlencode
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 def send_telegram(message):
 
-    try:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        return False
 
-        result = subprocess.run(
-            [
-                "python3",
-                "scripts/send_telegram.py",
-                message
-            ],
-            capture_output=True,
-            text=True,
-            timeout=25
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+        data = urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        }).encode("utf-8")
+
+        request = Request(
+            url,
+            data=data,
+            method="POST"
         )
 
-        if result.returncode != 0:
+        with urlopen(request, timeout=25) as response:
+            response.read()
 
-            print(
-                "Telegram send failed:",
-                result.stderr
-            )
-
-            return False
-
+        print("Telegram message sent")
         return True
 
     except Exception as e:
-
-        print("Telegram exception:", e)
-
+        print("Telegram send error:", e)
         return False
 
 
